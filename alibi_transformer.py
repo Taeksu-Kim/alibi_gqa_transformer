@@ -5,6 +5,8 @@ import math
 import warnings
 from typing import Optional, Tuple
 from einops import rearrange
+from bert_padding import index_first_axis, pad_input, unpad_input
+from flash_attn import flash_attn_varlen_func
 
 def _cast_if_autocast_enabled(tensor):
     if torch.is_autocast_enabled():
@@ -69,17 +71,65 @@ class LlamaMLP(nn.Module):
         self.hidden_size = config.d_model
         self.intermediate_size = config.feed_forward_dim
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.act_fn = nn.SiLU()
+        self.dropout = nn.Dropout(config.dropout_rate)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = nn.SiLU()
 
     def forward(self, x):
 
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate_output = self.act_fn(self.gate_proj(x))
+        gate_output = self.dropout(gate_output)
+        up_proj_output = self.up_proj(x)
+        down_proj = self.down_proj(gate_output * up_proj_output)
 
         return down_proj
 
-def scaled_multihead_dot_product_attention(query, key, value, q_n_heads, kv_n_heads, attn_bias=None, key_padding_mask=None, is_causal=False, needs_weights=False):
+def flash_attention(query: torch.Tensor, 
+                  key: torch.Tensor,  
+                  value: torch.Tensor, 
+                  n_heads: int, 
+                  kv_n_heads: Optional[int]=None, 
+                  dropout_p: float=0.0,
+                  training: bool=False,
+                  attn_bias: Optional[torch.Tensor]=None, 
+                  key_padding_mask: Optional[torch.Tensor]=None, 
+                  is_causal: bool=False,  
+                  needs_weights: bool=False, 
+                  ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+
+    # print(attn_bias)
+
+    (batch_size, seqlen) = query.shape[:2]
+    if key_padding_mask is None:
+        key_padding_mask = torch.ones_like(key[:, :, 0], dtype=torch.bool)
+        
+    query_padding_mask = key_padding_mask[:, -query.size(1):]
+    (query_unpad, indices_q, cu_seqlens_q, max_seqlen_q) = unpad_input(query, query_padding_mask)
+    query_unpad = rearrange(query_unpad, 'nnz (h d) -> nnz h d', h=n_heads)
+    (key_unpad, _, cu_seqlens_k, max_seqlen_k) = unpad_input(key, key_padding_mask)
+    key_unpad = rearrange(key_unpad, 'nnz (h d) -> nnz h d', h=kv_n_heads)
+    (value_unpad, _, _, _) = unpad_input(value, key_padding_mask)
+    value_unpad = rearrange(value_unpad, 'nnz (h d) -> nnz h d', h=kv_n_heads)
+
+    # if n_heads != kv_n_heads:
+    #     key_unpad = repeat_kv_for_flash_attention(key_unpad, n_heads // kv_n_heads)
+    #     value_unpad = repeat_kv_for_flash_attention(value_unpad, n_heads // kv_n_heads)
+
+    dropout_p = dropout_p if training else 0.0
+
+    output_unpad, attn_weight, S_dmask = flash_attn_varlen_func(q=query_unpad, k=key_unpad, v=value_unpad, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, dropout_p=dropout_p, causal=is_causal, alibi_slopes=attn_bias, return_attn_probs=True)
+
+    output = pad_input(output_unpad, indices_q, batch_size, seqlen)
+    output = rearrange(output, 'b s h d -> b s (h d)')
+    # print(output.shape)
+    # output = pad_input(rearrange(output_unpad, 'nnz h d -> nnz (h d)'), indices_q, batch_size, seqlen)
+
+    if needs_weights:
+        return (output, attn_weight)
+    return (output, None)
+
+def scaled_multihead_dot_product_attention(query, key, value, q_n_heads, kv_n_heads, dropout_rate, is_training, attn_bias=None, key_padding_mask=None, is_causal=False, needs_weights=False):
     q = rearrange(query, 'b s (h d) -> b h s d', h=q_n_heads)
     k = rearrange(key, 'b s (h d) -> b h d s', h=kv_n_heads)
     v = rearrange(value, 'b s (h d) -> b h s d', h=kv_n_heads)
@@ -113,6 +163,10 @@ def scaled_multihead_dot_product_attention(query, key, value, q_n_heads, kv_n_he
         causal_mask = causal_mask[-s_q:, -s_k:]
         attn_weight = attn_weight.masked_fill(causal_mask.view(1, 1, s_q, s_k), min_val)
     attn_weight = torch.softmax(attn_weight, dim=-1)
+    if dropout_rate > 0:
+        attn_weight = nn.functional.dropout(
+            attn_weight, p=dropout_rate, training=is_training
+        )
 
     out = attn_weight.to(v.dtype).matmul(v)
     out = rearrange(out, 'b h s d -> b s (h d)')
@@ -121,27 +175,29 @@ def scaled_multihead_dot_product_attention(query, key, value, q_n_heads, kv_n_he
     return (out, None)
 
 def build_attn_bias(attn_impl, attn_bias, n_heads, seq_len, causal=False, alibi_bias_max=8):
+    (device, dtype) = (attn_bias.device, attn_bias.dtype)
     if attn_impl == 'flash':
-        return None
+        slopes = gen_slopes(n_heads, attn_impl, alibi_bias_max, device=device)
+        return slopes
+    
     elif attn_impl in ['torch', 'triton']:
-        (device, dtype) = (attn_bias.device, attn_bias.dtype)
-        attn_bias = attn_bias.add(build_alibi_bias(n_heads, seq_len, full=not causal, alibi_bias_max=alibi_bias_max, device=device, dtype=dtype))
+        attn_bias = attn_bias.add(build_alibi_bias(n_heads, attn_impl, seq_len, full=not causal, alibi_bias_max=alibi_bias_max, device=device, dtype=dtype))
         return attn_bias
     else:
         raise ValueError(f'attn_impl={attn_impl!r} is an invalid setting.')
 
-def build_alibi_bias(n_heads, seq_len, full=False, alibi_bias_max=8, device=None, dtype=None):
+def build_alibi_bias(n_heads, attn_impl, seq_len, full=False, alibi_bias_max=8, device=None, dtype=None):
     alibi_bias = torch.arange(1 - seq_len, 1, dtype=torch.int32, device=device).view(1, 1, 1, seq_len)
     if full:
         alibi_bias = alibi_bias - torch.arange(1 - seq_len, 1, dtype=torch.int32, device=device).view(1, 1, seq_len, 1)
         alibi_bias = alibi_bias.abs().mul(-1)
-    slopes = gen_slopes(n_heads, alibi_bias_max, device=device)
+    slopes = gen_slopes(n_heads, attn_impl, alibi_bias_max, device=device)
     alibi_bias = alibi_bias * slopes
     return alibi_bias.to(dtype=dtype)
 
 def attn_bias_shape(attn_impl, n_heads, seq_len, causal):
     if attn_impl == 'flash':
-        return None
+        return (n_heads)
     elif attn_impl in ['torch', 'triton']:
         if not causal:
             return (1, n_heads, seq_len, seq_len)
@@ -150,13 +206,17 @@ def attn_bias_shape(attn_impl, n_heads, seq_len, causal):
     else:
         raise ValueError(f'attn_impl={attn_impl!r} is an invalid setting.')
 
-def gen_slopes(n_heads, alibi_bias_max=8, device=None):
+def gen_slopes(n_heads, attn_impl, alibi_bias_max=8, device=None):
     _n_heads = 2 ** math.ceil(math.log2(n_heads))
     m = torch.arange(1, _n_heads + 1, dtype=torch.float32, device=device)
     m = m.mul(alibi_bias_max / _n_heads)
     slopes = 1.0 / torch.pow(2, m)
     if _n_heads != n_heads:
         slopes = torch.concat([slopes[1::2], slopes[::2]])[:n_heads]
+    
+    if attn_impl == 'flash':
+        return slopes
+    
     return slopes.view(1, n_heads, 1, 1)
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -170,12 +230,25 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, n_kv_heads * n_rep, slen, head_dim)
     )
 
+def repeat_kv_for_flash_attention(hidden: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Perform repeat of kv heads along a particular dimension.
+    hidden.shape expected to be: (batch size, seq len, kv_n_heads, head_dim)
+    n_rep: amount of repetitions of kv_n_heads
+    Unlike torch.repeat_interleave, this function avoids allocating new memory.
+    """
+    if n_rep == 1:
+        return hidden
+    (num_cu_seq, kv_n_heads, d) = hidden.shape
+    hidden = hidden[:, :, None, :].expand(num_cu_seq, kv_n_heads, n_rep, d)
+    return hidden.reshape(num_cu_seq, kv_n_heads * n_rep, d)
+
 class MultiheadAttention(nn.Module):
 
     def __init__(self, 
                  d_model: int, 
                  q_n_heads: int,
                  kv_n_heads: int, 
+                 dropout_rate: float,
                  attn_impl: str='torch',
                  verbose: int=0, 
                  device: Optional[str]=None):
@@ -186,6 +259,7 @@ class MultiheadAttention(nn.Module):
         self.head_dim = d_model // q_n_heads
         self.q_n_heads = q_n_heads
         self.kv_n_heads = kv_n_heads
+        self.dropout_rate = dropout_rate
 
         self.Wqkv = nn.Linear(d_model, d_model + 2 * self.head_dim * self.kv_n_heads, device=device)
         fuse_splits = (d_model, d_model + self.head_dim * self.kv_n_heads)
@@ -196,8 +270,9 @@ class MultiheadAttention(nn.Module):
         self.Wv = nn.Linear(d_model, self.head_dim * self.kv_n_heads, device=device)
 
         if self.attn_impl == 'flash':
-            raise Exception("Not implement yet")
-            # self.attn_fn = flash_attn_fn
+            self.attn_fn = flash_attention
+            # raise Exception("Not implement yet")
+
         elif self.attn_impl == 'triton':
             raise Exception("Not implement yet")
             # self.attn_fn = triton_flash_attn_fn
@@ -223,7 +298,7 @@ class MultiheadAttention(nn.Module):
         
         key_padding_mask = attention_mask
 
-        (context, attn_weights) = self.attn_fn(query, key, value, self.q_n_heads, self.kv_n_heads, attn_bias=attn_bias, key_padding_mask=key_padding_mask, is_causal=is_causal, needs_weights=needs_weights)
+        (context, attn_weights) = self.attn_fn(query, key, value, self.q_n_heads, self.kv_n_heads, self.dropout_rate, self.training, attn_bias=attn_bias, key_padding_mask=key_padding_mask, is_causal=is_causal, needs_weights=needs_weights)
         return (self.out_proj(context), attn_weights)
 
 class TransformerEncoderLayer(nn.Module):
@@ -231,14 +306,17 @@ class TransformerEncoderLayer(nn.Module):
         super(TransformerEncoderLayer, self).__init__()
 
         norm_class = NORM_CLASS_REGISTRY[config.norm_type.lower()]
+        self.norm_strategy = config.enc_norm_strategy
+        assert self.norm_strategy in ['pre', 'post'],  "norm_strategy must be either 'pre' or 'post'."
         attn_class = MultiheadAttention
 
         d_model = config.d_model
         q_n_heads = config.q_n_heads
         kv_n_heads = config.kv_n_heads
+        self.dropout_rate = config.dropout_rate
 
         self.norm_1 = norm_class(d_model, device=device)
-        self.self_attn = attn_class(d_model=d_model, q_n_heads=q_n_heads, kv_n_heads=kv_n_heads, attn_impl=config.attn_impl, device=device)
+        self.self_attn = attn_class(d_model=d_model, q_n_heads=q_n_heads, kv_n_heads=kv_n_heads, dropout_rate=self.dropout_rate, attn_impl=config.attn_impl, device=device)
         self.norm_2 = norm_class(d_model, device=device)
         self.ffn = LlamaMLP(config)
 
@@ -248,12 +326,38 @@ class TransformerEncoderLayer(nn.Module):
                 attention_mask: Optional[torch.ByteTensor]=None, 
                 is_causal: bool=True) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor]]]:
         
-        a = self.norm_1(x)
-        (b, attn_weights) = self.self_attn(a, a, attn_bias=attn_bias, attention_mask=attention_mask, needs_weights=True, is_causal=is_causal)
-        x = x + b
-        m = self.norm_2(x)
-        n = self.ffn(m)
-        x = x + n
+        if self.norm_strategy == "pre":
+            a = self.norm_1(x)
+            (b, attn_weights) = self.self_attn(a, a, attn_bias=attn_bias, attention_mask=attention_mask, needs_weights=True, is_causal=is_causal)
+            if self.dropout_rate > 0:
+                b = nn.functional.dropout(
+                    b, p=self.dropout_rate, training=self.training
+                )
+            x = x + b
+            m = self.norm_2(x)
+            n = self.ffn(m)
+            if self.dropout_rate > 0:
+                n = nn.functional.dropout(
+                    n, p=self.dropout_rate, training=self.training
+                )
+            x = x + n
+
+        elif self.norm_strategy == "post":            
+            (a, attn_weights) = self.self_attn(x, x, attn_bias=attn_bias, attention_mask=attention_mask, needs_weights=True, is_causal=is_causal)
+            if self.dropout_rate > 0:
+                a = nn.functional.dropout(
+                    a, p=self.dropout_rate, training=self.training
+                )
+            x = x + a
+            m = self.norm_1(x)
+            n = self.ffn(m)
+            if self.dropout_rate > 0:
+                n = nn.functional.dropout(
+                    n, p=self.dropout_rate, training=self.training
+                )
+            x = x + n            
+            x = self.norm_2(x)
+
         return (x, attn_weights)
 
 class TransformerEncoder(nn.Module):
@@ -289,6 +393,7 @@ class TransformerEncoder(nn.Module):
                 self.attn_bias = build_attn_bias(self.attn_impl, self.attn_bias, self.config.q_n_heads, self.config.max_seq_len, causal=self.is_causal, alibi_bias_max=self.alibi_bias_max)
             self._attn_bias_initialized = True
         if self.attn_impl == 'flash':
+            self.attn_bias = self.attn_bias.to(dtype=dtype, device=device)
             return (self.attn_bias, attention_mask)
         if self.attn_bias is not None:
             self.attn_bias = self.attn_bias.to(dtype=dtype, device=device)
@@ -330,17 +435,21 @@ class TransformerDecoderLayer(nn.Module):
         super(TransformerDecoderLayer, self).__init__()
 
         norm_class = NORM_CLASS_REGISTRY[config.norm_type.lower()]
+        self.norm_strategy = config.dec_norm_strategy
+        assert self.norm_strategy in ['pre', 'post'],  "norm_strategy must be either 'pre' or 'post'."
+
         attn_class = MultiheadAttention
 
         d_model = config.d_model
         q_n_heads = config.q_n_heads
         kv_n_heads = config.kv_n_heads
+        self.dropout_rate = config.dropout_rate
 
         self.norm_1 = norm_class(d_model, device=device)
-        self.self_attn = attn_class(d_model=d_model, q_n_heads=q_n_heads, kv_n_heads=kv_n_heads, attn_impl=config.attn_impl, device=device)
+        self.self_attn = attn_class(d_model=d_model, q_n_heads=q_n_heads, kv_n_heads=kv_n_heads, dropout_rate=self.dropout_rate, attn_impl=config.attn_impl, device=device)
 
         self.norm_2 = norm_class(d_model, device=device)
-        self.cross_attn = attn_class(d_model=d_model, q_n_heads=q_n_heads, kv_n_heads=kv_n_heads, attn_impl=config.attn_impl, device=device)
+        self.cross_attn = attn_class(d_model=d_model, q_n_heads=q_n_heads, kv_n_heads=kv_n_heads, dropout_rate=self.dropout_rate, attn_impl=config.attn_impl, device=device)
 
         self.norm_3 = norm_class(d_model, device=device)
         self.ffn = LlamaMLP(config)
@@ -353,18 +462,58 @@ class TransformerDecoderLayer(nn.Module):
                 self_attention_mask: Optional[torch.ByteTensor]=None, 
                 cross_attention_mask: Optional[torch.ByteTensor]=None, 
                 ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor]]]:
-        
-        a = self.norm_1(x)
-        (b, attn_weights) = self.self_attn(a, a, attn_bias=self_attn_bias, attention_mask=self_attention_mask, needs_weights=True, is_causal=True)
-        x = x + b
-        
-        a = self.norm_2(x)
-        (b, attn_weights) = self.cross_attn(a, enc_outputs, attn_bias=cross_attn_bias, attention_mask=cross_attention_mask, needs_weights=True, is_causal=False)
-        x = x + b
-        
-        m = self.norm_3(x)
-        n = self.ffn(m)
-        x = x + n
+
+        if self.norm_strategy == "pre":
+            a = self.norm_1(x)
+            (b, attn_weights) = self.self_attn(a, a, attn_bias=self_attn_bias, attention_mask=self_attention_mask, needs_weights=True, is_causal=True)
+            if self.dropout_rate > 0:
+                b = nn.functional.dropout(
+                    b, p=self.dropout_rate, training=self.training
+                )
+            x = x + b
+            
+            a = self.norm_2(x)
+            (b, attn_weights) = self.cross_attn(a, enc_outputs, attn_bias=cross_attn_bias, attention_mask=cross_attention_mask, needs_weights=True, is_causal=False)
+            if self.dropout_rate > 0:
+                b = nn.functional.dropout(
+                    b, p=self.dropout_rate, training=self.training
+                )
+            x = x + b
+            
+            m = self.norm_3(x)
+            n = self.ffn(m)
+            if self.dropout_rate > 0:
+                n = nn.functional.dropout(
+                    n, p=self.dropout_rate, training=self.training
+                )
+            x = x + n
+
+        elif self.norm_strategy == "post":            
+            (a, attn_weights) = self.self_attn(x, x, attn_bias=self_attn_bias, attention_mask=self_attention_mask, needs_weights=True, is_causal=True)
+            if self.dropout_rate > 0:
+                a = nn.functional.dropout(
+                    a, p=self.dropout_rate, training=self.training
+                )
+            x = x + a
+            x = self.norm_1(x)
+
+            (a, attn_weights) = self.cross_attn(x, enc_outputs, attn_bias=cross_attn_bias, attention_mask=cross_attention_mask, needs_weights=True, is_causal=False)
+            if self.dropout_rate > 0:
+                a = nn.functional.dropout(
+                    a, p=self.dropout_rate, training=self.training
+                )
+            x = x + a
+
+            m = self.norm_2(x)
+            n = self.ffn(m)
+            if self.dropout_rate > 0:
+                n = nn.functional.dropout(
+                    n, p=self.dropout_rate, training=self.training
+                )
+            x = x + n
+
+            x = self.norm_3(x)
+
         return (x, attn_weights)
 
 class TransformerDecoder(nn.Module):
@@ -405,6 +554,7 @@ class TransformerDecoder(nn.Module):
                 self.self_attn_bias = build_attn_bias(self.attn_impl, self.self_attn_bias, self.config.q_n_heads, self.config.max_seq_len, causal=True, alibi_bias_max=self.alibi_bias_max)
             self._self_attn_bias_initialized = True
         if self.attn_impl == 'flash':
+            self.self_attn_bias = self.self_attn_bias.to(dtype=dtype, device=device)
             return (self.self_attn_bias, attention_mask)
         if self.self_attn_bias is not None:
             self.self_attn_bias = self.self_attn_bias.to(dtype=dtype, device=device)
@@ -429,6 +579,7 @@ class TransformerDecoder(nn.Module):
                 self.cross_attn_bias = build_attn_bias(self.attn_impl, self.cross_attn_bias, self.config.q_n_heads, self.config.max_seq_len, causal=False, alibi_bias_max=self.alibi_bias_max)
             self._cross_attn_bias_initialized = True
         if self.attn_impl == 'flash':
+            self.cross_attn_bias = self.cross_attn_bias.to(dtype=dtype, device=device)
             return (self.cross_attn_bias, attention_mask)
         if self.cross_attn_bias is not None:
             self.cross_attn_bias = self.cross_attn_bias.to(dtype=dtype, device=device)
